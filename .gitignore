@@ -22,5 +22,5 @@ __pycache__/
 .DS_Store
 Thumbs.db
 
-# Dynamic test images (like the one Antigravity downloaded)
+# Dynamic test images
 obama.jpg
