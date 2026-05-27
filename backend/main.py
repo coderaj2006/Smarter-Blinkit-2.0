@@ -6,8 +6,10 @@ from sqlalchemy.orm import selectinload
 from database import get_db, engine, Base
 from models import Product
 from utils import calculate_distance
+from auth import router as auth_router
 
 app = FastAPI(title="Smart Marketplace API")
+app.include_router(auth_router)
 
 @app.on_event("startup")
 async def startup_event():

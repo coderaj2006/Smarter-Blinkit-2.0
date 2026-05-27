@@ -2,7 +2,7 @@ from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
 from sqlalchemy.orm import declarative_base, sessionmaker
 
 # Replace with your actual database URL
-DATABASE_URL = "postgresql+asyncpg://user:password@localhost:5432/smart_marketplace"
+DATABASE_URL = "postgresql+asyncpg://postgres:notaagam%401234@localhost:5432/smart_marketplace"
 
 engine = create_async_engine(DATABASE_URL, echo=True)
 

@@ -1,0 +1,26 @@
+# Environment Variables (CRITICAL)
+.env
+.env.*
+
+# Python virtual environment
+venv/
+.venv/
+env/
+
+# Python caching
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+
+# Local database files or logs
+*.db
+*.log
+
+# OS specific files
+.DS_Store
+Thumbs.db
+
+# Dynamic test images (like the one Antigravity downloaded)
+obama.jpg
