@@ -11,6 +11,7 @@ from database import get_db, engine, Base
 from models import ProductCatalog, SellerInventory, Shop, User
 from utils import calculate_distance
 from auth import router as auth_router
+from agent import extract_ingredients, resolve_ingredients_globally
 
 SECRET_KEY = os.getenv("JWT_SECRET", "fallback-dev-secret-change-in-production")
 ALGORITHM  = "HS256"
@@ -600,4 +601,137 @@ async def verify_payment(
         raise HTTPException(
             status_code=400,
             detail=f"Inventory update failed: {str(e)}",
+        )
+
+
+# ---------------------------------------------------------------------------
+# Stage 2 — AI Recipe Agent
+# ---------------------------------------------------------------------------
+
+class RecipeAgentRequest(PydanticBaseModel):
+    prompt:    str
+    latitude:  float
+    longitude: float
+
+
+@app.post("/api/agent/recipe")
+async def recipe_agent(
+    body:          RecipeAgentRequest,
+    authorization: str = Header(..., alias="Authorization"),
+    db:            AsyncSession = Depends(get_db),
+):
+    """
+    AI Recipe Agent — converts a natural-language meal request into a
+    location-sorted shopping list sourced from the live database.
+
+    Pipeline
+    ────────
+    1. JWT validation  — any authenticated user (buyer or seller) may call this.
+
+    2. Groq LLM parse  — llama3-8b-8192 with response_format={"type":"json_object"}
+                         extracts a clean list of grocery ingredient strings from
+                         the user's free-text prompt.
+
+    3. Global DB scan  — for every ingredient, an unrestricted SQLAlchemy query
+                         (no LIMIT, no bounding box) scans the entire
+                         SellerInventory × ProductCatalog × Shop join using
+                         ILIKE fuzzy matching on name AND description.
+
+    4. Haversine sort  — from all in-stock candidates per ingredient, the single
+                         closest seller to the buyer's coordinates is selected.
+
+    5. Response        — one product object per ingredient (status="found") or a
+                         "not_found" sentinel for ingredients with zero stock
+                         anywhere in the database.
+
+    Request body
+    ────────────
+    {
+      "prompt":    "Make Margherita pizza for 4 people",
+      "latitude":  26.8631,
+      "longitude": 75.8106
+    }
+
+    Response shape
+    ──────────────
+    {
+      "prompt":      "Make Margherita pizza for 4 people",
+      "ingredients_extracted": ["pizza flour", "mozzarella cheese", ...],
+      "results": [
+        {
+          "ingredient":  "pizza flour",
+          "status":      "found",
+          "id":          42,
+          "name":        "Aashirvaad Multigrain Flour",
+          "price":       85.0,
+          "stock_count": 120,
+          "shop": { "shop_name": "...", "distance_km": 1.3, ... },
+          ...
+        },
+        {
+          "ingredient": "yeast",
+          "status":     "not_found",
+          "message":    "No in-stock product found for 'yeast'"
+        },
+        ...
+      ],
+      "found_count":     5,
+      "not_found_count": 1
+    }
+    """
+    # ── 1. Auth — accept any valid JWT (buyer or seller) ────────────────────
+    _decode_buyer_token(authorization)
+
+    prompt    = body.prompt.strip()
+    buyer_lat = body.latitude
+    buyer_lon = body.longitude
+
+    if not prompt:
+        raise HTTPException(status_code=422, detail="Prompt cannot be empty.")
+
+    print(f"[agent/recipe] prompt={prompt!r}  lat={buyer_lat}  lon={buyer_lon}")
+
+    try:
+        # ── 2. LLM parsing — Groq extracts structured ingredient list ────────
+        ingredients = await extract_ingredients(prompt)
+
+        if not ingredients:
+            raise HTTPException(
+                status_code=422,
+                detail="Could not extract any ingredients from the prompt. "
+                       "Try being more specific, e.g. 'Make pasta carbonara for 2'.",
+            )
+
+        print(f"[agent/recipe] {len(ingredients)} ingredients to resolve: {ingredients}")
+
+        # ── 3 & 4. Global DB scan + Haversine sort (concurrent) ──────────────
+        results = await resolve_ingredients_globally(
+            ingredients, buyer_lat, buyer_lon, db
+        )
+
+        found_count     = sum(1 for r in results if r.get("status") == "found")
+        not_found_count = sum(1 for r in results if r.get("status") == "not_found")
+
+        print(
+            f"[agent/recipe] resolved: {found_count} found, "
+            f"{not_found_count} not_found"
+        )
+
+        # ── 5. Response ───────────────────────────────────────────────────────
+        return {
+            "prompt":               prompt,
+            "ingredients_extracted": ingredients,
+            "results":              results,
+            "found_count":          found_count,
+            "not_found_count":      not_found_count,
+        }
+
+    except HTTPException:
+        raise   # re-raise FastAPI exceptions as-is
+
+    except Exception as exc:
+        print(f"[agent/recipe] Unhandled error: {exc!r}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Recipe agent failed: {str(exc)}",
         )

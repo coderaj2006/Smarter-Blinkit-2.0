@@ -35,6 +35,8 @@ class Shop(Base):
 class ProductCatalog(Base):
     """
     Unified product catalog (SKU-like) shared across all sellers.
+    name_embedding: 384-dim vector from all-MiniLM-L6-v2, used for
+    semantic similarity search in the AI recipe agent.
     """
     __tablename__ = "product_catalog"
 
@@ -43,6 +45,9 @@ class ProductCatalog(Base):
     description = Column(String)
     category = Column(String, nullable=True, index=True)
     image_url = Column(String)
+    # 384-dim sentence embedding stored as plain FLOAT[] — no pgvector needed.
+    # Populated by embed_products.py. NULL until that script has been run.
+    name_embedding = Column(ARRAY(Float), nullable=True)
 
     inventory_items = relationship("SellerInventory", back_populates="product_catalog", cascade="all, delete")
 
