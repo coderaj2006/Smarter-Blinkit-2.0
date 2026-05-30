@@ -3,6 +3,9 @@ uvicorn==0.24.0.post1
 sqlalchemy==2.0.23
 asyncpg==0.29.0
 pydantic==2.5.2
+pydantic[email]==2.5.2
 face_recognition==1.3.0
 opencv-python-headless==4.8.1.78
 PyJWT==2.8.0
+bcrypt==5.0.0
+python-dotenv==1.0.0

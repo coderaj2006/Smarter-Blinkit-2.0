@@ -1,7 +1,6 @@
 import asyncio
-from sqlalchemy.ext.asyncio import AsyncSession
 from database import engine, AsyncSessionLocal, Base
-from models import User, Shop, Product, RoleEnum
+from models import ProductCatalog, RoleEnum, SellerInventory, Shop, User
 
 async def seed_data():
     print("Initializing database schema...")
@@ -26,65 +25,63 @@ async def seed_data():
         shop = Shop(
             owner_id=seller.id,
             shop_name="Blinkit SuperMart",
-            latitude=28.7041,
-            longitude=77.1025
+            latitude=28.6200,
+            longitude=77.2050
         )
         session.add(shop)
         await session.flush()  # Flush to get the shop ID
         
-        # Create diverse realistic products
-        products = [
-            Product(
-                shop_id=shop.id,
+        # Create diverse realistic catalog products + seller inventory rows
+        catalog_rows = [
+            ProductCatalog(
                 name="Amul Taaza Toned Milk (1L)",
                 description="Fresh toned milk packed with nutrients.",
-                price=68.0,
-                stock_count=50,
-                barcode_string="8901262150117",
-                image_url="https://example.com/milk.jpg"
+                category="Dairy",
+                image_url="https://example.com/milk.jpg",
             ),
-            Product(
-                shop_id=shop.id,
+            ProductCatalog(
                 name="Britannia NutriChoice Digestive Biscuits (100g)",
                 description="Healthy digestive biscuits with whole wheat.",
-                price=30.0,
-                stock_count=120,
-                barcode_string="8901063013217",
-                image_url="https://example.com/biscuits.jpg"
+                category="Snacks",
+                image_url="https://example.com/biscuits.jpg",
             ),
-            Product(
-                shop_id=shop.id,
+            ProductCatalog(
                 name="Maggi 2-Minute Noodles (70g)",
                 description="Instant noodles, the classic Indian snack.",
-                price=14.0,
-                stock_count=300,
-                barcode_string="8901058141257",
-                image_url="https://example.com/maggi.jpg"
+                category="Instant Food",
+                image_url="https://example.com/maggi.jpg",
             ),
-            Product(
-                shop_id=shop.id,
+            ProductCatalog(
                 name="Surf Excel Easy Wash Detergent Powder (1kg)",
                 description="Tough stain removal powder.",
-                price=135.0,
-                stock_count=20,
-                barcode_string="8901030588665",
-                image_url="https://example.com/detergent.jpg"
+                category="Cleaning",
+                image_url="https://example.com/detergent.jpg",
             ),
-            Product(
-                shop_id=shop.id,
+            ProductCatalog(
                 name="Aashirvaad Shudh Chakki Atta (5kg)",
                 description="100% whole wheat atta.",
-                price=240.0,
-                stock_count=45,
-                barcode_string="8901725132204",
-                image_url="https://example.com/atta.jpg"
-            )
+                category="Staples",
+                image_url="https://example.com/atta.jpg",
+            ),
         ]
-        
-        session.add_all(products)
+
+        session.add_all(catalog_rows)
+        await session.flush()
+
+        inventory_rows = [
+            SellerInventory(product_catalog_id=catalog_rows[0].id, shop_id=shop.id, price=68.0, stock_quantity=50),
+            SellerInventory(product_catalog_id=catalog_rows[1].id, shop_id=shop.id, price=30.0, stock_quantity=120),
+            SellerInventory(product_catalog_id=catalog_rows[2].id, shop_id=shop.id, price=14.0, stock_quantity=300),
+            SellerInventory(product_catalog_id=catalog_rows[3].id, shop_id=shop.id, price=135.0, stock_quantity=20),
+            SellerInventory(product_catalog_id=catalog_rows[4].id, shop_id=shop.id, price=240.0, stock_quantity=45),
+        ]
+
+        session.add_all(inventory_rows)
         await session.commit()
         
-        print(f"Successfully inserted {len(products)} products into the shop '{shop.shop_name}' owned by '{seller.name}'.")
+        print(
+            f"Successfully inserted {len(inventory_rows)} inventory items for shop '{shop.shop_name}' owned by '{seller.name}'."
+        )
 
 if __name__ == "__main__":
     asyncio.run(seed_data())

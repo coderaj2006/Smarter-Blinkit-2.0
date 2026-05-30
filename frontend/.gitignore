@@ -1,0 +1,25 @@
+# =============================================================================
+#  frontend/.gitignore
+#  Lean complement to the root .gitignore.
+#  The root file already covers node_modules, dist, .env, logs, and IDE files.
+#  This file adds Vite/React-specific patterns that only apply inside /frontend.
+# =============================================================================
+
+# Local environment overrides (Vite reads these automatically)
+.env.local
+.env.*.local
+
+# Vite internal cache
+.vite/
+
+# TypeScript incremental build info
+tsconfig.tsbuildinfo
+tsconfig.app.tsbuildinfo
+tsconfig.node.tsbuildinfo
+
+# Test output (Vitest / Jest)
+coverage/
+.vitest/
+
+# Storybook (if added later)
+storybook-static/

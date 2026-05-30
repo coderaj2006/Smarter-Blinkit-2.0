@@ -1,15 +1,33 @@
 import base64
+import os
+import bcrypt
 import numpy as np
 import cv2
 import face_recognition
 from datetime import datetime, timedelta
 from typing import List, Optional
 import jwt
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Depends
 from pydantic import BaseModel, EmailStr
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.future import select
+from dotenv import load_dotenv
+from database import get_db
+from models import User, RoleEnum
+
+load_dotenv()
+
+# --- Password Hashing (bcrypt direct — avoids passlib/bcrypt 4.x incompatibility) ---
+def hash_password(plain: str) -> str:
+    """Hash a plaintext password using bcrypt. Returns a utf-8 string for DB storage."""
+    return bcrypt.hashpw(plain.encode("utf-8"), bcrypt.gensalt()).decode("utf-8")
+
+def verify_password(plain: str, hashed: str) -> bool:
+    """Constant-time comparison of a plaintext password against a stored bcrypt hash."""
+    return bcrypt.checkpw(plain.encode("utf-8"), hashed.encode("utf-8"))
 
 # --- Configuration for JWT Token Generation ---
-SECRET_KEY = "your-very-secure-secret-key-change-in-production"
+SECRET_KEY = os.getenv("JWT_SECRET", "fallback-dev-secret-change-in-production")
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 60
 
@@ -18,6 +36,17 @@ router = APIRouter(prefix="/api/auth", tags=["auth"])
 class FaceLoginRequest(BaseModel):
     email: EmailStr
     image_base64: str
+
+class RegisterRequest(BaseModel):
+    name: str
+    email: EmailStr
+    password: str
+    role: RoleEnum
+    image_base64: str
+
+class PasswordLoginRequest(BaseModel):
+    email: EmailStr
+    password: str
 
 def create_access_token(data: dict, expires_delta: Optional[timedelta] = None):
     """Generates a secure JWT containing user credentials."""
@@ -31,15 +60,12 @@ def create_access_token(data: dict, expires_delta: Optional[timedelta] = None):
     encoded_jwt = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
     return encoded_jwt
 
-def get_stored_face_embedding(email: str) -> Optional[List[float]]:
-    """
-    MOCK FUNCTION: Retrieves a pre-saved list of 128-dimensional floats.
-    In a real application, you would query the database using SQLAlchemy:
-    user = db.query(User).filter(User.email == email).first()
-    return user.face_embedding if user else None
-    """
-    if email == "test@example.com":
-        return [0.0] * 128  # Placeholder for a real 128D numpy array list
+async def get_stored_face_embedding(email: str, db: AsyncSession) -> Optional[List[float]]:
+    stmt = select(User).where(User.email == email)
+    result = await db.execute(stmt)
+    user = result.scalars().first()
+    if user and user.face_embedding:
+        return user.face_embedding
     return None
 
 def decode_base64_image(base64_string: str) -> np.ndarray:
@@ -60,16 +86,19 @@ def decode_base64_image(base64_string: str) -> np.ndarray:
     return img
 
 @router.post("/face-login")
-async def face_login(payload: FaceLoginRequest):
+async def face_login(payload: FaceLoginRequest, db: AsyncSession = Depends(get_db)):
     # 1. Fetch stored embedding for the user
-    stored_embedding = get_stored_face_embedding(payload.email)
-    if not stored_embedding:
+    stmt = select(User).where(User.email == payload.email)
+    result = await db.execute(stmt)
+    user = result.scalars().first()
+
+    if not user or not user.face_embedding:
         raise HTTPException(
             status_code=404, 
             detail="User not found or no face profile registered."
         )
         
-    known_encoding = np.array(stored_embedding)
+    known_encoding = np.array(user.face_embedding)
 
     # 2. Decode the incoming webcam frame
     try:
@@ -108,9 +137,8 @@ async def face_login(payload: FaceLoginRequest):
     
     if matches[0]:
         # Verification successful! 
-        # Ideally, we would grab user_id and role from the DB object here.
-        user_id = 1
-        user_role = "buyer" 
+        user_id = user.id
+        user_role = user.role.value 
         
         # 6. Generate secure JWT
         access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
@@ -128,3 +156,77 @@ async def face_login(payload: FaceLoginRequest):
     else:
         # Verification failed
         raise HTTPException(status_code=401, detail="Face does not match registered profile.")
+
+@router.post("/register")
+async def register_user(payload: RegisterRequest, db: AsyncSession = Depends(get_db)):
+    # Check if user exists
+    stmt = select(User).where(User.email == payload.email)
+    result = await db.execute(stmt)
+    if result.scalars().first():
+        raise HTTPException(status_code=400, detail="Email already registered")
+
+    try:
+        img = decode_base64_image(payload.image_base64)
+        if img is None:
+            raise ValueError("Empty image")
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid base64 image payload.")
+
+    rgb_img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+    face_locations = face_recognition.face_locations(rgb_img)
+
+    if len(face_locations) == 0:
+        raise HTTPException(status_code=400, detail="No face detected. Please try again.")
+    elif len(face_locations) > 1:
+        raise HTTPException(status_code=400, detail="Multiple faces detected.")
+
+    face_encoding = face_recognition.face_encodings(rgb_img, face_locations)[0]
+
+    # Create new user — password is bcrypt-hashed before storage
+    new_user = User(
+        name=payload.name,
+        email=payload.email,
+        hashed_password=hash_password(payload.password),
+        role=payload.role,
+        face_embedding=face_encoding.tolist()
+    )
+    
+    db.add(new_user)
+    await db.commit()
+    await db.refresh(new_user)
+
+    # Automatically generate token after registration
+    access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+    access_token = create_access_token(
+        data={"sub": new_user.email, "user_id": new_user.id, "role": new_user.role.value},
+        expires_delta=access_token_expires
+    )
+    
+    return {
+        "access_token": access_token, 
+        "token_type": "bearer",
+        "message": "User registered successfully"
+    }
+
+@router.post("/login")
+async def password_login(payload: PasswordLoginRequest, db: AsyncSession = Depends(get_db)):
+    """Standard email + password login. Verifies bcrypt hash."""
+    stmt = select(User).where(User.email == payload.email)
+    result = await db.execute(stmt)
+    user = result.scalars().first()
+
+    # Use constant-time verify to prevent user enumeration via timing attacks.
+    if not user or not verify_password(payload.password, user.hashed_password):
+        raise HTTPException(status_code=401, detail="Invalid email or password.")
+
+    access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+    access_token = create_access_token(
+        data={"sub": user.email, "user_id": user.id, "role": user.role.value},
+        expires_delta=access_token_expires,
+    )
+
+    return {
+        "access_token": access_token,
+        "token_type": "bearer",
+        "message": "Login successful",
+    }
