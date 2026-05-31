@@ -4,6 +4,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
 from sqlalchemy import or_
 from typing import Optional
+import asyncio
 import jwt
 import os
 
@@ -12,6 +13,11 @@ from models import ProductCatalog, SellerInventory, Shop, User
 from utils import calculate_distance
 from auth import router as auth_router
 from agent import extract_ingredients, resolve_ingredients_globally
+from graph import (
+    init_driver, close_driver,
+    sync_product_to_graph, create_purchase_relationship,
+    get_alternatives, get_bought_together,
+)
 
 SECRET_KEY = os.getenv("JWT_SECRET", "fallback-dev-secret-change-in-production")
 ALGORITHM  = "HS256"
@@ -32,6 +38,13 @@ async def startup_event():
     # In production, use Alembic migrations instead of create_all()
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+    # Connect to Neo4j — degrades gracefully if unavailable
+    await init_driver()
+
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    await close_driver()
 
 @app.get("/api/products/search")
 async def search_products(
@@ -583,6 +596,27 @@ async def verify_payment(
             # Commit all stock changes atomically
             await db.commit()
 
+            # ── Graph: record co-purchase relationships ───────────────────────
+            # For every pair of distinct catalog items in this order, increment
+            # the BOUGHT_WITH edge weight in Neo4j. Fire-and-forget — we don't
+            # await the result so it never blocks the payment response.
+            catalog_ids = []
+            for item in body.items:
+                try:
+                    inv_id = int(item.inventory_id)
+                    inv_result = await db.execute(
+                        select(SellerInventory).where(SellerInventory.id == inv_id)
+                    )
+                    inv_row = inv_result.scalars().first()
+                    if inv_row:
+                        catalog_ids.append(inv_row.product_catalog_id)
+                except (ValueError, TypeError):
+                    pass
+
+            import itertools
+            for id_a, id_b in itertools.combinations(set(catalog_ids), 2):
+                asyncio.create_task(create_purchase_relationship(id_a, id_b))
+
         print(f"[payments/verify] Stock updated for {len(stock_updates)} item(s). Payment complete.")
 
         return {
@@ -602,6 +636,154 @@ async def verify_payment(
             status_code=400,
             detail=f"Inventory update failed: {str(e)}",
         )
+
+
+# ---------------------------------------------------------------------------
+# Stage 2 — Neo4j Recommendation Engine
+# ---------------------------------------------------------------------------
+
+def _hydrate_catalog_rows(
+    rows: list,
+    buyer_lat: float | None = None,
+    buyer_lon: float | None = None,
+) -> list[dict]:
+    """
+    Convert (SellerInventory, ProductCatalog, Shop) tuples into the standard
+    product dict shape used across all endpoints.
+    Optionally attaches distance_km if buyer coordinates are provided.
+    """
+    results = []
+    for inv, cat, shop in rows:
+        dist = None
+        if buyer_lat is not None and buyer_lon is not None:
+            dist = round(calculate_distance(buyer_lat, buyer_lon, shop.latitude, shop.longitude), 2)
+        results.append({
+            "id":                 inv.id,
+            "product_catalog_id": cat.id,
+            "name":               cat.name,
+            "description":        cat.description,
+            "category":           cat.category,
+            "price":              inv.price,
+            "stock_count":        inv.stock_quantity,
+            "image_url":          cat.image_url,
+            "shop": {
+                "id":          shop.id,
+                "shop_name":   shop.shop_name,
+                "latitude":    shop.latitude,
+                "longitude":   shop.longitude,
+                "distance_km": dist,
+            },
+        })
+    return results
+
+
+async def _fetch_products_by_catalog_ids(
+    catalog_ids: list[int],
+    db: AsyncSession,
+) -> list[dict]:
+    """
+    Given a list of ProductCatalog IDs (returned by Neo4j Cypher queries),
+    fetch the best in-stock SellerInventory row for each one from PostgreSQL
+    and return fully hydrated product objects.
+
+    'Best' = lowest price among in-stock sellers for that catalog item.
+    """
+    if not catalog_ids:
+        return []
+
+    stmt = (
+        select(SellerInventory, ProductCatalog, Shop)
+        .join(ProductCatalog, SellerInventory.product_catalog_id == ProductCatalog.id)
+        .join(Shop,            SellerInventory.shop_id            == Shop.id)
+        .where(
+            ProductCatalog.id.in_(catalog_ids),
+            SellerInventory.stock_quantity > 0,
+        )
+        .order_by(SellerInventory.price.asc())
+    )
+
+    result = await db.execute(stmt)
+    rows   = result.all()
+
+    # Deduplicate: keep only the cheapest inventory row per catalog ID
+    seen:    set[int]  = set()
+    deduped: list      = []
+    for row in rows:
+        inv, cat, shop = row
+        if cat.id not in seen:
+            seen.add(cat.id)
+            deduped.append(row)
+
+    # Preserve the Neo4j ordering (relevance / weight order)
+    order_map = {cid: idx for idx, cid in enumerate(catalog_ids)}
+    deduped.sort(key=lambda r: order_map.get(r[1].id, 999))
+
+    return _hydrate_catalog_rows(deduped)
+
+
+@app.get("/api/products/{product_catalog_id}/recommendations")
+async def get_product_recommendations(
+    product_catalog_id: int,
+    authorization: str = Header(..., alias="Authorization"),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Return two recommendation lists for a given ProductCatalog ID:
+
+    1. alternatives   — products in the same category (SIMILAR_TO edges).
+                        Useful when the current item is low/out of stock.
+
+    2. bought_together — products frequently purchased alongside this one
+                         (BOUGHT_WITH edges, ordered by co-purchase weight).
+                         Populated automatically as users complete checkouts.
+
+    Both lists are hydrated from PostgreSQL so the frontend receives full
+    product objects (price, image, shop, stock_count) — not just IDs.
+
+    Response shape:
+    {
+      "product_catalog_id": 42,
+      "alternatives":    [ { ...product }, ... ],   // up to 6
+      "bought_together": [ { ...product }, ... ]    // up to 4
+    }
+    """
+    _decode_buyer_token(authorization)
+
+    # Verify the product exists in SQL
+    cat_result = await db.execute(
+        select(ProductCatalog).where(ProductCatalog.id == product_catalog_id)
+    )
+    catalog = cat_result.scalars().first()
+    if not catalog:
+        raise HTTPException(status_code=404, detail="Product not found.")
+
+    try:
+        # Run both Neo4j queries concurrently
+        alt_ids, together_ids = await asyncio.gather(
+            get_alternatives(product_catalog_id),
+            get_bought_together(product_catalog_id),
+        )
+
+        print(
+            f"[recommendations] catalog_id={product_catalog_id} "
+            f"alternatives={alt_ids} bought_together={together_ids}"
+        )
+
+        # Hydrate both lists from PostgreSQL concurrently
+        alternatives, bought_together = await asyncio.gather(
+            _fetch_products_by_catalog_ids(alt_ids, db),
+            _fetch_products_by_catalog_ids(together_ids, db),
+        )
+
+        return {
+            "product_catalog_id": product_catalog_id,
+            "alternatives":       alternatives,
+            "bought_together":    bought_together,
+        }
+
+    except Exception as exc:
+        print(f"[recommendations] Error for catalog_id={product_catalog_id}: {exc!r}")
+        raise HTTPException(status_code=500, detail=f"Recommendation query failed: {str(exc)}")
 
 
 # ---------------------------------------------------------------------------
